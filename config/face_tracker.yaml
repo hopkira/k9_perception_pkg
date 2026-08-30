@@ -1,0 +1,8 @@
+face_tracker:
+  ros__parameters:
+    detections_topic: "/k9/perception/faces"
+    tracked_faces_topic: "/k9/perception/tracked_faces"
+
+    max_track_age: 0.75
+    max_center_distance: 180.0
+    min_iou: 0.10

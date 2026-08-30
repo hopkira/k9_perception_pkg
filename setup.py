@@ -51,8 +51,8 @@ setup(
 
     entry_points={
         'console_scripts': [
-            'face_detector = '
-            'k9_perception_pkg.face_detector_node:main',
+            'face_detector = k9_perception_pkg.face_detector_node:main',
+            'face_tracker = k9_perception_pkg.face_tracker_node:main',
         ],
     },
 )
