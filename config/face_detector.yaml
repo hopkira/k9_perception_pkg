@@ -1,0 +1,23 @@
+face_detector:
+  ros__parameters:
+
+    image_topic: "/k9/camera/eye/image/compressed"
+
+    detections_topic: "/k9/perception/faces"
+    face_count_topic: "/k9/perception/face_count"
+
+    debug_topic: "/k9/perception/faces/debug/compressed"
+
+    model_path: "/home/hopkira/k9_ws/src/k9_perception_pkg/models/face_detection_yunet_2023mar.onnx"
+
+    # Initial detector tuning
+    score_threshold: 0.75
+    nms_threshold: 0.3
+    top_k: 50
+
+    # Camera remains 30 Hz; initially detect faces at 15 Hz.
+    max_processing_rate: 15.0
+
+    publish_debug_image: true
+    debug_jpeg_quality: 80
+
