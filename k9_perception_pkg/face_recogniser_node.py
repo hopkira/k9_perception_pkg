@@ -1,13 +1,11 @@
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional
 
 import cv2
 import numpy as np
 import rclpy
-
-from pathlib import Path
-from collections import Counter
 
 from rclpy.node import Node
 from rclpy.qos import (
@@ -34,8 +32,13 @@ class RecognitionState:
     observations: int = 0
     last_attempt_monotonic: float = 0.0
 
+    candidate_identity: str = ""
+    candidate_count: int = 0
+    candidate_confidence: float = 0.0
+
 
 class FaceRecogniserNode(Node):
+
     def __init__(self):
         super().__init__("face_recogniser")
 
@@ -59,6 +62,27 @@ class FaceRecogniserNode(Node):
         )
 
         self.declare_parameter(
+            "face_database",
+            "~/k9_data/faces",
+        )
+
+        self.declare_parameter(
+            "yunet_model",
+            (
+                "~/k9_ws/src/k9_perception_pkg/"
+                "models/face_detection_yunet_2023mar.onnx"
+            ),
+        )
+
+        self.declare_parameter(
+            "sface_model",
+            (
+                "~/k9_ws/src/k9_perception_pkg/"
+                "models/face_recognition_sface_2021dec.onnx"
+            ),
+        )
+
+        self.declare_parameter(
             "min_face_width",
             80,
         )
@@ -75,25 +99,17 @@ class FaceRecogniserNode(Node):
 
         self.declare_parameter(
             "crop_margin",
-            0.20,
-        )
-
-        self.declare_parameter(
-            "face_database",
-            "~/k9_data/faces",
-        )
-
-        self.declare_parameter(
-            "sface_model",
-            (
-                "~/k9_ws/src/k9_perception_pkg/"
-                "models/face_recognition_sface_2021dec.onnx"
-            ),
+            0.30,
         )
 
         self.declare_parameter(
             "recognition_threshold",
             0.50,
+        )
+
+        self.declare_parameter(
+            "recognition_margin",
+            0.08,
         )
 
         self.declare_parameter(
@@ -105,6 +121,10 @@ class FaceRecogniserNode(Node):
             "confirmation_count",
             3,
         )
+
+        # ------------------------------------------------------------
+        # Read parameters
+        # ------------------------------------------------------------
 
         self.image_topic = self.get_parameter(
             "image_topic"
@@ -118,27 +138,19 @@ class FaceRecogniserNode(Node):
             "recognised_faces_topic"
         ).value
 
-        self.min_face_width = int(
-            self.get_parameter("min_face_width").value
-        )
-
-        self.min_face_height = int(
-            self.get_parameter("min_face_height").value
-        )
-
-        self.recognition_interval = float(
-            self.get_parameter("recognition_interval").value
-        )
-
-        self.crop_margin = float(
-            self.get_parameter("crop_margin").value
-        )
-
         self.face_database = Path(
             self.get_parameter(
                 "face_database"
             ).value
         ).expanduser()
+
+        self.yunet_model = str(
+            Path(
+                self.get_parameter(
+                    "yunet_model"
+                ).value
+            ).expanduser()
+        )
 
         self.sface_model = str(
             Path(
@@ -148,9 +160,39 @@ class FaceRecogniserNode(Node):
             ).expanduser()
         )
 
+        self.min_face_width = int(
+            self.get_parameter(
+                "min_face_width"
+            ).value
+        )
+
+        self.min_face_height = int(
+            self.get_parameter(
+                "min_face_height"
+            ).value
+        )
+
+        self.recognition_interval = float(
+            self.get_parameter(
+                "recognition_interval"
+            ).value
+        )
+
+        self.crop_margin = float(
+            self.get_parameter(
+                "crop_margin"
+            ).value
+        )
+
         self.recognition_threshold = float(
             self.get_parameter(
                 "recognition_threshold"
+            ).value
+        )
+
+        self.recognition_margin = float(
+            self.get_parameter(
+                "recognition_margin"
             ).value
         )
 
@@ -166,15 +208,37 @@ class FaceRecogniserNode(Node):
             ).value
         )
 
+        # ------------------------------------------------------------
+        # Face models
+        # ------------------------------------------------------------
+
+        self.detector_width = 320
+        self.detector_height = 320
+
+        self.detector = cv2.FaceDetectorYN.create(
+            self.yunet_model,
+            "",
+            (
+                self.detector_width,
+                self.detector_height,
+            ),
+            0.75,
+            0.3,
+            50,
+        )
+
         self.recogniser = cv2.FaceRecognizerSF.create(
             self.sface_model,
             "",
         )
 
+        # ------------------------------------------------------------
+        # Load enrolled people
+        # ------------------------------------------------------------
+
         self.face_database_embeddings = (
             self.load_face_database()
         )
-
 
         # ------------------------------------------------------------
         # QoS
@@ -217,11 +281,18 @@ class FaceRecogniserNode(Node):
         self.latest_frame: Optional[np.ndarray] = None
         self.latest_image_stamp = None
 
-        self.track_states: Dict[int, RecognitionState] = {}
+        self.track_states: Dict[
+            int,
+            RecognitionState,
+        ] = {}
 
         self.frames_received = 0
         self.track_messages_received = 0
         self.recognition_attempts = 0
+
+        # ------------------------------------------------------------
+        # Startup diagnostics
+        # ------------------------------------------------------------
 
         self.get_logger().info(
             "Face recogniser started: "
@@ -231,14 +302,104 @@ class FaceRecogniserNode(Node):
         )
 
         self.get_logger().info(
-            f"OpenCV version: {cv2.__version__}"
+            f"OpenCV version: {cv2.__version__} "
+            f"from {cv2.__file__}"
         )
+
+        self.get_logger().info(
+            "Recognition configuration: "
+            f"threshold={self.recognition_threshold:.2f}, "
+            f"margin={self.recognition_margin:.2f}, "
+            f"top_matches={self.top_matches}, "
+            f"confirmations={self.confirmation_count}"
+        )
+
+    # ------------------------------------------------------------
+    # Database
+    # ------------------------------------------------------------
+
+    def load_face_database(self):
+
+        database = {}
+
+        if not self.face_database.exists():
+            self.get_logger().warning(
+                f"Face database does not exist: "
+                f"{self.face_database}"
+            )
+            return database
+
+        for person_dir in sorted(
+            self.face_database.iterdir()
+        ):
+
+            if not person_dir.is_dir():
+                continue
+
+            embeddings = []
+
+            for filename in sorted(
+                person_dir.glob("*.npy")
+            ):
+
+                try:
+                    embedding = np.load(
+                        filename
+                    ).astype(
+                        np.float32
+                    ).flatten()
+
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"Could not load {filename}: {exc}"
+                    )
+                    continue
+
+                norm = np.linalg.norm(
+                    embedding
+                )
+
+                if norm <= 0.0:
+                    self.get_logger().warning(
+                        f"Ignoring zero-length embedding: "
+                        f"{filename}"
+                    )
+                    continue
+
+                embedding /= norm
+
+                embeddings.append(
+                    embedding
+                )
+
+            if embeddings:
+
+                database[
+                    person_dir.name
+                ] = embeddings
+
+                self.get_logger().info(
+                    f"Loaded {len(embeddings)} "
+                    f"embeddings for "
+                    f"'{person_dir.name}'"
+                )
+
+        self.get_logger().info(
+            f"Face database contains "
+            f"{len(database)} identities"
+        )
+
+        return database
 
     # ------------------------------------------------------------
     # Image handling
     # ------------------------------------------------------------
 
-    def image_callback(self, msg: CompressedImage):
+    def image_callback(
+        self,
+        msg: CompressedImage,
+    ):
+
         self.frames_received += 1
 
         encoded = np.frombuffer(
@@ -261,209 +422,289 @@ class FaceRecogniserNode(Node):
         self.latest_image_stamp = msg.header.stamp
 
     # ------------------------------------------------------------
-    # Bounding box helpers
+    # Bounding-box helpers
     # ------------------------------------------------------------
 
     @staticmethod
     def bbox_values(bbox):
-        cx = float(bbox.center.position.x)
-        cy = float(bbox.center.position.y)
 
-        width = float(bbox.size_x)
-        height = float(bbox.size_y)
+        cx = float(
+            bbox.center.position.x
+        )
 
-        return cx, cy, width, height
+        cy = float(
+            bbox.center.position.y
+        )
 
-    def crop_face(self, frame, bbox):
-        cx, cy, width, height = self.bbox_values(bbox)
+        width = float(
+            bbox.size_x
+        )
 
-        margin_x = width * self.crop_margin
-        margin_y = height * self.crop_margin
+        height = float(
+            bbox.size_y
+        )
 
-        x1 = int(cx - width / 2.0 - margin_x)
-        y1 = int(cy - height / 2.0 - margin_y)
+        return (
+            cx,
+            cy,
+            width,
+            height,
+        )
 
-        x2 = int(cx + width / 2.0 + margin_x)
-        y2 = int(cy + height / 2.0 + margin_y)
+    def face_is_large_enough(
+        self,
+        bbox,
+    ):
 
-        frame_height, frame_width = frame.shape[:2]
-
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-
-        x2 = min(frame_width, x2)
-        y2 = min(frame_height, y2)
-
-        if x2 <= x1 or y2 <= y1:
-            return None
-
-        return frame[y1:y2, x1:x2]
-
-    # ------------------------------------------------------------
-    # Quality gate
-    # ------------------------------------------------------------
-
-    def face_is_large_enough(self, bbox):
-        _, _, width, height = self.bbox_values(bbox)
+        _, _, width, height = (
+            self.bbox_values(
+                bbox
+            )
+        )
 
         return (
             width >= self.min_face_width
-            and height >= self.min_face_height
+            and
+            height >= self.min_face_height
         )
 
     # ------------------------------------------------------------
-    # Recognition backend placeholder
+    # Crop the tracked face
     # ------------------------------------------------------------
 
-    def recognise_face(self, face_crop):
-        """
-        Recognition backend.
+    def crop_face(
+        self,
+        frame,
+        bbox,
+    ):
 
-        This will shortly be replaced with:
+        (
+            cx,
+            cy,
+            width,
+            height,
+        ) = self.bbox_values(
+            bbox
+        )
 
-            crop
-              -> alignment
-              -> ArcFace embedding
-              -> cosine similarity
-              -> identity
+        margin_x = (
+            width * self.crop_margin
+        )
 
-        For now return UNKNOWN so that we can validate the
-        complete ROS pipeline independently of the model.
-        """
+        margin_y = (
+            height * self.crop_margin
+        )
 
-        self.recognition_attempts += 1
+        x1 = int(
+            cx
+            - width / 2.0
+            - margin_x
+        )
 
-        return "", 0.0, False
+        y1 = int(
+            cy
+            - height / 2.0
+            - margin_y
+        )
 
-    # ------------------------------------------------------------
-    # Track processing
-    # ------------------------------------------------------------
+        x2 = int(
+            cx
+            + width / 2.0
+            + margin_x
+        )
 
-    def tracks_callback(self, msg: TrackedFaceArray):
-        self.track_messages_received += 1
+        y2 = int(
+            cy
+            + height / 2.0
+            + margin_y
+        )
 
-        output = RecognisedFaceArray()
-        output.header = msg.header
+        frame_height, frame_width = (
+            frame.shape[:2]
+        )
 
-        if self.latest_frame is None:
-            self.publisher.publish(output)
-            return
+        x1 = max(
+            0,
+            x1,
+        )
 
-        active_track_ids = set()
+        y1 = max(
+            0,
+            y1,
+        )
 
-        now = time.monotonic()
+        x2 = min(
+            frame_width,
+            x2,
+        )
 
-        for tracked_face in msg.faces:
+        y2 = min(
+            frame_height,
+            y2,
+        )
 
-            track_id = int(tracked_face.track_id)
-            active_track_ids.add(track_id)
+        if (
+            x2 <= x1
+            or
+            y2 <= y1
+        ):
+            return None
 
-            state = self.track_states.get(track_id)
-
-            if state is None:
-                state = RecognitionState()
-                self.track_states[track_id] = state
-
-                self.get_logger().info(
-                    f"Recognition candidate track: {track_id}"
-                )
-
-            # ----------------------------------------------------
-            # Only attempt recognition when:
-            #
-            # 1. We have not already recognised this track.
-            # 2. Enough time has elapsed since the previous try.
-            # 3. The face is large enough.
-            # ----------------------------------------------------
-
-            should_attempt = (
-                not state.recognised
-                and (
-                    now - state.last_attempt_monotonic
-                    >= self.recognition_interval
-                )
-                and self.face_is_large_enough(
-                    tracked_face.bbox
-                )
-            )
-
-            if should_attempt:
-
-                crop = self.crop_face(
-                    self.latest_frame,
-                    tracked_face.bbox,
-                )
-
-                if crop is not None:
-
-                    identity, confidence, recognised = (
-                        self.recognise_face(crop)
-                    )
-
-                    state.observations += 1
-                    state.last_attempt_monotonic = now
-
-                    if recognised:
-                        state.identity = identity
-                        state.confidence = confidence
-                        state.recognised = True
-
-                        self.get_logger().info(
-                            f"Track {track_id} recognised as "
-                            f"{identity} "
-                            f"(confidence={confidence:.3f})"
-                        )
-
-            # ----------------------------------------------------
-            # Publish enriched track
-            # ----------------------------------------------------
-
-            recognised_face = RecognisedFace()
-
-            recognised_face.track_id = track_id
-            recognised_face.identity = state.identity
-            recognised_face.recognition_confidence = (
-                state.confidence
-            )
-            recognised_face.recognised = state.recognised
-
-            recognised_face.bbox = tracked_face.bbox
-
-            recognised_face.first_seen = (
-                tracked_face.first_seen
-            )
-
-            recognised_face.last_seen = (
-                tracked_face.last_seen
-            )
-
-            output.faces.append(recognised_face)
-
-        # --------------------------------------------------------
-        # Forget recognition state for tracks which no longer
-        # exist.
-        #
-        # The tracker is therefore authoritative for track life.
-        # --------------------------------------------------------
-
-        expired_ids = [
-            track_id
-            for track_id in self.track_states.keys()
-            if track_id not in active_track_ids
+        return frame[
+            y1:y2,
+            x1:x2
         ]
 
-        for track_id in expired_ids:
-            del self.track_states[track_id]
+    # ------------------------------------------------------------
+    # Detect face landmarks within tracked crop
+    # ------------------------------------------------------------
 
-        self.publisher.publish(output)
+    def detect_face_in_crop(
+        self,
+        crop,
+    ):
 
+        crop_height, crop_width = (
+            crop.shape[:2]
+        )
 
-    def match_embedding(self, embedding):
+        if (
+            crop_width < 40
+            or
+            crop_height < 40
+        ):
+            return None
 
-        best_identity = ""
-        best_score = 0.0
+        detector_image = cv2.resize(
+            crop,
+            (
+                self.detector_width,
+                self.detector_height,
+            ),
+        )
 
-        for identity, known_embeddings in (
+        try:
+            _, faces = self.detector.detect(
+                detector_image
+            )
+
+        except cv2.error as exc:
+            self.get_logger().warning(
+                f"YuNet inference failed: {exc}"
+            )
+            return None
+
+        if (
+            faces is None
+            or
+            len(faces) == 0
+        ):
+            return None
+
+        # Pick the highest-confidence face.
+        face = max(
+            faces,
+            key=lambda row: row[14],
+        ).copy()
+
+        scale_x = (
+            crop_width
+            / self.detector_width
+        )
+
+        scale_y = (
+            crop_height
+            / self.detector_height
+        )
+
+        # Bounding box
+        face[0] *= scale_x
+        face[1] *= scale_y
+        face[2] *= scale_x
+        face[3] *= scale_y
+
+        # Five facial landmarks
+        for i in range(
+            4,
+            14,
+            2,
+        ):
+            face[i] *= scale_x
+            face[i + 1] *= scale_y
+
+        return face
+
+    # ------------------------------------------------------------
+    # Generate SFace embedding
+    # ------------------------------------------------------------
+
+    def create_embedding(
+        self,
+        crop,
+        face,
+    ):
+
+        try:
+
+            aligned = (
+                self.recogniser.alignCrop(
+                    crop,
+                    face,
+                )
+            )
+
+            feature = (
+                self.recogniser.feature(
+                    aligned
+                )
+            )
+
+        except cv2.error as exc:
+
+            self.get_logger().warning(
+                f"SFace inference failed: {exc}"
+            )
+
+            return None
+
+        embedding = np.asarray(
+            feature,
+            dtype=np.float32,
+        ).flatten()
+
+        norm = np.linalg.norm(
+            embedding
+        )
+
+        if norm <= 0.0:
+            return None
+
+        embedding /= norm
+
+        return embedding
+
+    # ------------------------------------------------------------
+    # Match embedding against database
+    # ------------------------------------------------------------
+
+    def match_embedding(
+        self,
+        embedding,
+    ):
+
+        if not self.face_database_embeddings:
+            return (
+                "",
+                0.0,
+                False,
+            )
+
+        identity_scores = []
+
+        for (
+            identity,
+            known_embeddings,
+        ) in (
             self.face_database_embeddings.items()
         ):
 
@@ -493,17 +734,55 @@ class FaceRecogniserNode(Node):
                 )
             )
 
-            if identity_score > best_score:
-                best_score = identity_score
-                best_identity = identity
+            identity_scores.append(
+                (
+                    identity_score,
+                    identity,
+                )
+            )
 
-        recognised = (
-            best_score
-            >= self.recognition_threshold
+        identity_scores.sort(
+            reverse=True
         )
 
-        if not recognised:
-            return "", best_score, False
+        best_score, best_identity = (
+            identity_scores[0]
+        )
+
+        if len(identity_scores) > 1:
+            second_best_score = (
+                identity_scores[1][0]
+            )
+        else:
+            second_best_score = -1.0
+
+        margin = (
+            best_score
+            - second_best_score
+        )
+
+        accepted = (
+            best_score
+            >= self.recognition_threshold
+            and
+            margin
+            >= self.recognition_margin
+        )
+
+        self.get_logger().debug(
+            f"Match: "
+            f"{best_identity}={best_score:.3f}, "
+            f"second={second_best_score:.3f}, "
+            f"margin={margin:.3f}, "
+            f"accepted={accepted}"
+        )
+
+        if not accepted:
+            return (
+                "",
+                best_score,
+                False,
+            )
 
         return (
             best_identity,
@@ -511,7 +790,293 @@ class FaceRecogniserNode(Node):
             True,
         )
 
+    # ------------------------------------------------------------
+    # Complete recognition operation
+    # ------------------------------------------------------------
+
+    def recognise_face(
+        self,
+        face_crop,
+    ):
+
+        self.recognition_attempts += 1
+
+        face = self.detect_face_in_crop(
+            face_crop
+        )
+
+        if face is None:
+            return (
+                "",
+                0.0,
+                False,
+            )
+
+        embedding = self.create_embedding(
+            face_crop,
+            face,
+        )
+
+        if embedding is None:
+            return (
+                "",
+                0.0,
+                False,
+            )
+
+        return self.match_embedding(
+            embedding
+        )
+
+    # ------------------------------------------------------------
+    # Multi-observation confirmation
+    # ------------------------------------------------------------
+
+    def update_candidate(
+        self,
+        track_id,
+        state,
+        identity,
+        confidence,
+        recognised,
+    ):
+
+        if not recognised:
+
+            # A failed observation doesn't immediately destroy
+            # a candidate, but it doesn't advance it either.
+            return
+
+        if (
+            identity
+            == state.candidate_identity
+        ):
+
+            state.candidate_count += 1
+
+            state.candidate_confidence = max(
+                state.candidate_confidence,
+                confidence,
+            )
+
+        else:
+
+            state.candidate_identity = (
+                identity
+            )
+
+            state.candidate_count = 1
+
+            state.candidate_confidence = (
+                confidence
+            )
+
+        self.get_logger().info(
+            f"Track {track_id}: candidate "
+            f"'{state.candidate_identity}' "
+            f"{state.candidate_count}/"
+            f"{self.confirmation_count} "
+            f"(score={confidence:.3f})"
+        )
+
+        if (
+            state.candidate_count
+            >= self.confirmation_count
+        ):
+
+            state.identity = (
+                state.candidate_identity
+            )
+
+            state.confidence = (
+                state.candidate_confidence
+            )
+
+            state.recognised = True
+
+            self.get_logger().info(
+                f"Track {track_id} recognised as "
+                f"'{state.identity}' "
+                f"(confidence="
+                f"{state.confidence:.3f})"
+            )
+
+    # ------------------------------------------------------------
+    # Track callback
+    # ------------------------------------------------------------
+
+    def tracks_callback(
+        self,
+        msg: TrackedFaceArray,
+    ):
+
+        self.track_messages_received += 1
+
+        output = RecognisedFaceArray()
+        output.header = msg.header
+
+        if self.latest_frame is None:
+            self.publisher.publish(
+                output
+            )
+            return
+
+        active_track_ids = set()
+
+        now = time.monotonic()
+
+        for tracked_face in msg.faces:
+
+            track_id = int(
+                tracked_face.track_id
+            )
+
+            active_track_ids.add(
+                track_id
+            )
+
+            state = self.track_states.get(
+                track_id
+            )
+
+            if state is None:
+
+                state = RecognitionState()
+
+                self.track_states[
+                    track_id
+                ] = state
+
+                self.get_logger().info(
+                    f"Recognition candidate "
+                    f"track: {track_id}"
+                )
+
+            # ----------------------------------------------------
+            # Recognition attempt
+            # ----------------------------------------------------
+
+            should_attempt = (
+                not state.recognised
+                and
+                (
+                    now
+                    - state.last_attempt_monotonic
+                    >= self.recognition_interval
+                )
+                and
+                self.face_is_large_enough(
+                    tracked_face.bbox
+                )
+            )
+
+            if should_attempt:
+
+                crop = self.crop_face(
+                    self.latest_frame,
+                    tracked_face.bbox,
+                )
+
+                if crop is not None:
+
+                    (
+                        identity,
+                        confidence,
+                        recognised,
+                    ) = self.recognise_face(
+                        crop
+                    )
+
+                    state.observations += 1
+
+                    state.last_attempt_monotonic = (
+                        now
+                    )
+
+                    self.update_candidate(
+                        track_id,
+                        state,
+                        identity,
+                        confidence,
+                        recognised,
+                    )
+
+            # ----------------------------------------------------
+            # Publish enriched tracked face
+            # ----------------------------------------------------
+
+            recognised_face = (
+                RecognisedFace()
+            )
+
+            recognised_face.track_id = (
+                track_id
+            )
+
+            recognised_face.identity = (
+                state.identity
+            )
+
+            recognised_face.recognition_confidence = (
+                state.confidence
+            )
+
+            recognised_face.recognised = (
+                state.recognised
+            )
+
+            recognised_face.bbox = (
+                tracked_face.bbox
+            )
+
+            recognised_face.first_seen = (
+                tracked_face.first_seen
+            )
+
+            recognised_face.last_seen = (
+                tracked_face.last_seen
+            )
+
+            output.faces.append(
+                recognised_face
+            )
+
+        # --------------------------------------------------------
+        # Tracker owns track lifetime.
+        # --------------------------------------------------------
+
+        expired_ids = [
+            track_id
+            for track_id
+            in self.track_states.keys()
+            if track_id
+            not in active_track_ids
+        ]
+
+        for track_id in expired_ids:
+
+            state = self.track_states[
+                track_id
+            ]
+
+            if state.recognised:
+                self.get_logger().info(
+                    f"Recognised face left: "
+                    f"track={track_id}, "
+                    f"identity='{state.identity}'"
+                )
+
+            del self.track_states[
+                track_id
+            ]
+
+        self.publisher.publish(
+            output
+        )
+
+
 def main(args=None):
+
     rclpy.init(args=args)
 
     node = FaceRecogniserNode()
@@ -524,7 +1089,9 @@ def main(args=None):
 
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -2,13 +2,27 @@ face_recogniser:
   ros__parameters:
 
     image_topic: "/k9/camera/eye/image/compressed"
+
     tracked_faces_topic: "/k9/perception/tracked_faces"
 
     recognised_faces_topic: "/k9/perception/recognised_faces"
+
+    face_database: "/home/hopkira/k9_data/faces"
+
+    yunet_model: "/home/hopkira/k9_ws/src/k9_perception_pkg/models/face_detection_yunet_2023mar.onnx"
+
+    sface_model: "/home/hopkira/k9_ws/src/k9_perception_pkg/models/face_recognition_sface_2021dec.onnx"
 
     min_face_width: 80
     min_face_height: 80
 
     recognition_interval: 0.5
 
-    crop_margin: 0.20
+    crop_margin: 0.30
+
+    recognition_threshold: 0.50
+    recognition_margin: 0.08
+
+    top_matches: 3
+
+    confirmation_count: 3
