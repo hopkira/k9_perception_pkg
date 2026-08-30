@@ -108,6 +108,16 @@ class FaceDetectorNode(Node):
             80,
         )
 
+        self.declare_parameter(
+            "detector_width",
+            640,
+        )
+
+        self.declare_parameter(
+            "detector_height",
+            384,
+        )
+
         self.image_topic = (
             self.get_parameter("image_topic")
             .get_parameter_value()
@@ -206,7 +216,7 @@ class FaceDetectorNode(Node):
         self.detector = cv2.FaceDetectorYN.create(
             self.model_path,
             "",
-            (320, 320),
+            (self.detector_width, self.detector_height),
             self.score_threshold,
             self.nms_threshold,
             self.top_k,
@@ -327,16 +337,38 @@ class FaceDetectorNode(Node):
 
         height, width = frame.shape[:2]
 
-        # YuNet needs to know the actual image dimensions.
-        self.detector.setInputSize(
-            (width, height)
+        # Resize to a YuNet-friendly input size.
+        detector_frame = cv2.resize(
+            frame,
+            (self.detector_width, self.detector_height),
+            interpolation=cv2.INTER_LINEAR,
         )
 
-        # --------------------------------------------------------------
-        # Face detection
-        # --------------------------------------------------------------
+        try:
+            _, faces = self.detector.detect(detector_frame)
+        except cv2.error as exc:
+            self.get_logger().error(
+                f"YuNet inference failed: {exc}"
+            )
+            return
 
-        _, faces = self.detector.detect(frame)
+        # Scale YuNet results back into original 1280x720 coordinates.
+        scale_x = width / self.detector_width
+        scale_y = height / self.detector_height
+
+        if faces is not None:
+            faces = faces.copy()
+
+            # Bounding box
+            faces[:, 0] *= scale_x
+            faces[:, 1] *= scale_y
+            faces[:, 2] *= scale_x
+            faces[:, 3] *= scale_y
+
+            # Five landmarks
+            for i in range(4, 14, 2):
+                faces[:, i] *= scale_x
+                faces[:, i + 1] *= scale_y
 
         detection_array = Detection2DArray()
         detection_array.header = msg.header

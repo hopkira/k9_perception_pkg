@@ -20,4 +20,9 @@ face_detector:
 
     publish_debug_image: true
     debug_jpeg_quality: 80
+    
+    detector_width: 640
+    detector_height: 384
+
+
 
