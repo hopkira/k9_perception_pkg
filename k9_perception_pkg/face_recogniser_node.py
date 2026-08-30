@@ -6,6 +6,9 @@ import cv2
 import numpy as np
 import rclpy
 
+from pathlib import Path
+from collections import Counter
+
 from rclpy.node import Node
 from rclpy.qos import (
     QoSProfile,
@@ -75,6 +78,34 @@ class FaceRecogniserNode(Node):
             0.20,
         )
 
+        self.declare_parameter(
+            "face_database",
+            "~/k9_data/faces",
+        )
+
+        self.declare_parameter(
+            "sface_model",
+            (
+                "~/k9_ws/src/k9_perception_pkg/"
+                "models/face_recognition_sface_2021dec.onnx"
+            ),
+        )
+
+        self.declare_parameter(
+            "recognition_threshold",
+            0.50,
+        )
+
+        self.declare_parameter(
+            "top_matches",
+            3,
+        )
+
+        self.declare_parameter(
+            "confirmation_count",
+            3,
+        )
+
         self.image_topic = self.get_parameter(
             "image_topic"
         ).value
@@ -102,6 +133,48 @@ class FaceRecogniserNode(Node):
         self.crop_margin = float(
             self.get_parameter("crop_margin").value
         )
+
+        self.face_database = Path(
+            self.get_parameter(
+                "face_database"
+            ).value
+        ).expanduser()
+
+        self.sface_model = str(
+            Path(
+                self.get_parameter(
+                    "sface_model"
+                ).value
+            ).expanduser()
+        )
+
+        self.recognition_threshold = float(
+            self.get_parameter(
+                "recognition_threshold"
+            ).value
+        )
+
+        self.top_matches = int(
+            self.get_parameter(
+                "top_matches"
+            ).value
+        )
+
+        self.confirmation_count = int(
+            self.get_parameter(
+                "confirmation_count"
+            ).value
+        )
+
+        self.recogniser = cv2.FaceRecognizerSF.create(
+            self.sface_model,
+            "",
+        )
+
+        self.face_database_embeddings = (
+            self.load_face_database()
+        )
+
 
         # ------------------------------------------------------------
         # QoS
@@ -384,6 +457,59 @@ class FaceRecogniserNode(Node):
 
         self.publisher.publish(output)
 
+
+    def match_embedding(self, embedding):
+
+        best_identity = ""
+        best_score = 0.0
+
+        for identity, known_embeddings in (
+            self.face_database_embeddings.items()
+        ):
+
+            scores = [
+                float(
+                    np.dot(
+                        embedding,
+                        known_embedding,
+                    )
+                )
+                for known_embedding
+                in known_embeddings
+            ]
+
+            scores.sort(
+                reverse=True
+            )
+
+            count = min(
+                self.top_matches,
+                len(scores),
+            )
+
+            identity_score = float(
+                np.mean(
+                    scores[:count]
+                )
+            )
+
+            if identity_score > best_score:
+                best_score = identity_score
+                best_identity = identity
+
+        recognised = (
+            best_score
+            >= self.recognition_threshold
+        )
+
+        if not recognised:
+            return "", best_score, False
+
+        return (
+            best_identity,
+            best_score,
+            True,
+        )
 
 def main(args=None):
     rclpy.init(args=args)
