@@ -118,6 +118,18 @@ class FaceDetectorNode(Node):
             384,
         )
 
+        self.detector_width = (
+            self.get_parameter("detector_width")
+            .get_parameter_value()
+            .integer_value
+        )
+
+        self.detector_height = (
+            self.get_parameter("detector_height")
+            .get_parameter_value()
+            .integer_value
+        )
+
         self.image_topic = (
             self.get_parameter("image_topic")
             .get_parameter_value()
