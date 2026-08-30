@@ -15,14 +15,14 @@ face_detector:
     nms_threshold: 0.3
     top_k: 50
 
-    # Camera remains 30 Hz; initially detect faces at 15 Hz.
-    max_processing_rate: 15.0
+    # Camera remains 30 Hz; initially detect faces at 8 Hz.
+    max_processing_rate: 8.0
 
     publish_debug_image: true
     debug_jpeg_quality: 80
     
-    detector_width: 640
-    detector_height: 384
+    detector_width: 512
+    detector_height: 288
 
 
 

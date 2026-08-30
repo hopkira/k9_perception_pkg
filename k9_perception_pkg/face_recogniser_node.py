@@ -1,11 +1,12 @@
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import cv2
 import numpy as np
 import rclpy
+import threading
 
 from rclpy.node import Node
 from rclpy.qos import (
@@ -278,7 +279,8 @@ class FaceRecogniserNode(Node):
         # Runtime state
         # ------------------------------------------------------------
 
-        self.latest_frame: Optional[np.ndarray] = None
+        self._image_lock = threading.Lock()
+        self.latest_image_data = None
         self.latest_image_stamp = None
 
         self.track_states: Dict[
@@ -317,6 +319,27 @@ class FaceRecogniserNode(Node):
     # ------------------------------------------------------------
     # Database
     # ------------------------------------------------------------
+
+    def get_latest_frame(self):
+
+        with self._image_lock:
+
+            if self.latest_image_data is None:
+                return None
+
+            image_data = (
+                self.latest_image_data
+            )
+
+        encoded = np.frombuffer(
+            image_data,
+            dtype=np.uint8,
+        )
+
+        return cv2.imdecode(
+            encoded,
+            cv2.IMREAD_COLOR,
+        )
 
     def load_face_database(self):
 
@@ -402,24 +425,16 @@ class FaceRecogniserNode(Node):
 
         self.frames_received += 1
 
-        encoded = np.frombuffer(
-            msg.data,
-            dtype=np.uint8,
-        )
-
-        frame = cv2.imdecode(
-            encoded,
-            cv2.IMREAD_COLOR,
-        )
-
-        if frame is None:
-            self.get_logger().warning(
-                "Unable to decode camera JPEG"
+        # Keep only the latest compressed JPEG.
+        # Do not decode every camera frame.
+        with self._image_lock:
+            self.latest_image_data = bytes(
+                msg.data
             )
-            return
 
-        self.latest_frame = frame
-        self.latest_image_stamp = msg.header.stamp
+            self.latest_image_stamp = (
+                msg.header.stamp
+            )
 
     # ------------------------------------------------------------
     # Bounding-box helpers
@@ -915,7 +930,14 @@ class FaceRecogniserNode(Node):
         output = RecognisedFaceArray()
         output.header = msg.header
 
-        if self.latest_frame is None:
+        # If we have never received a camera image,
+        # there is nothing available for recognition.
+        with self._image_lock:
+            have_image = (
+                self.latest_image_data is not None
+            )
+
+        if not have_image:
             self.publisher.publish(
                 output
             )
@@ -924,6 +946,10 @@ class FaceRecogniserNode(Node):
         active_track_ids = set()
 
         now = time.monotonic()
+
+        # Decode at most once during this tracker callback,
+        # and only if a face actually needs recognition.
+        frame = None
 
         for tracked_face in msg.faces:
 
@@ -971,36 +997,40 @@ class FaceRecogniserNode(Node):
             )
 
             if should_attempt:
+                # Only decode the JPEG when a recognition
+                # attempt is genuinely required.
 
-                crop = self.crop_face(
-                    self.latest_frame,
-                    tracked_face.bbox,
-                )
+                state.last_attempt_monotonic = now
 
-                if crop is not None:
+                if frame is None:
+                    frame = self.get_latest_frame()
 
-                    (
-                        identity,
-                        confidence,
-                        recognised,
-                    ) = self.recognise_face(
-                        crop
+                if frame is not None:
+
+                    crop = self.crop_face(
+                        frame,
+                        tracked_face.bbox,
                     )
 
-                    state.observations += 1
+                    if crop is not None:
 
-                    state.last_attempt_monotonic = (
-                        now
-                    )
+                        (
+                            identity,
+                            confidence,
+                            recognised,
+                        ) = self.recognise_face(
+                            crop
+                        )
 
-                    self.update_candidate(
-                        track_id,
-                        state,
-                        identity,
-                        confidence,
-                        recognised,
-                    )
+                        state.observations += 1
 
+                        self.update_candidate(
+                            track_id,
+                            state,
+                            identity,
+                            confidence,
+                            recognised,
+                        )
             # ----------------------------------------------------
             # Publish enriched tracked face
             # ----------------------------------------------------
