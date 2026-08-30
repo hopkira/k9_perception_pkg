@@ -53,6 +53,7 @@ setup(
         'console_scripts': [
             'face_detector = k9_perception_pkg.face_detector_node:main',
             'face_tracker = k9_perception_pkg.face_tracker_node:main',
+            'face_recogniser = k9_perception_pkg.face_recogniser_node:main',
         ],
     },
 )

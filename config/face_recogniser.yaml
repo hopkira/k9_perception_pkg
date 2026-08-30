@@ -1,0 +1,14 @@
+face_recogniser:
+  ros__parameters:
+
+    image_topic: "/k9/camera/eye/image/compressed"
+    tracked_faces_topic: "/k9/perception/tracked_faces"
+
+    recognised_faces_topic: "/k9/perception/recognised_faces"
+
+    min_face_width: 80
+    min_face_height: 80
+
+    recognition_interval: 0.5
+
+    crop_margin: 0.20
