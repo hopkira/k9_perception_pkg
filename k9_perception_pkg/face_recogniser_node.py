@@ -1,3 +1,6 @@
+import json
+import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +11,13 @@ import numpy as np
 import rclpy
 import threading
 
+from rclpy.action import (
+    ActionServer,
+    CancelResponse,
+    GoalResponse,
+)
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
     QoSProfile,
@@ -16,7 +26,10 @@ from rclpy.qos import (
 )
 
 from sensor_msgs.msg import CompressedImage
+from std_srvs.srv import Trigger
 
+from k9_interfaces_pkg.action import CaptureFace
+from k9_interfaces_pkg.srv import CommitFaceEnrollment
 from k9_interfaces_pkg.msg import (
     TrackedFaceArray,
     RecognisedFace,
@@ -123,6 +136,16 @@ class FaceRecogniserNode(Node):
             3,
         )
 
+        self.declare_parameter(
+            "enrolment_capture_timeout",
+            20.0,
+        )
+
+        self.declare_parameter(
+            "enrolment_sample_interval",
+            0.6,
+        )
+
         # ------------------------------------------------------------
         # Read parameters
         # ------------------------------------------------------------
@@ -209,6 +232,23 @@ class FaceRecogniserNode(Node):
             ).value
         )
 
+        self.enrolment_capture_timeout = float(
+            self.get_parameter(
+                "enrolment_capture_timeout"
+            ).value
+        )
+
+        self.enrolment_sample_interval = float(
+            self.get_parameter(
+                "enrolment_sample_interval"
+            ).value
+        )
+
+        self.enrolment_staging_root = (
+            self.face_database
+            / ".enrolment"
+        )
+
         # ------------------------------------------------------------
         # Face models
         # ------------------------------------------------------------
@@ -233,10 +273,16 @@ class FaceRecogniserNode(Node):
             "",
         )
 
+        # YuNet/SFace objects are shared by normal recognition and the
+        # enrolment action. Serialise access because OpenCV does not promise
+        # these model wrappers are safe for concurrent inference.
+        self._model_lock = threading.Lock()
+
         # ------------------------------------------------------------
         # Load enrolled people
         # ------------------------------------------------------------
 
+        self.face_database_metadata = {}
         self.face_database_embeddings = (
             self.load_face_database()
         )
@@ -275,6 +321,36 @@ class FaceRecogniserNode(Node):
             qos,
         )
 
+        # Face enrolment runs inside this recogniser so it reuses the same
+        # camera, tracker, YuNet and SFace pipeline as normal recognition.
+        self._enrolment_callback_group = ReentrantCallbackGroup()
+        self._enrolment_goal_lock = threading.Lock()
+        self._enrolment_goal_active = False
+
+        self.capture_face_action = ActionServer(
+            self,
+            CaptureFace,
+            "/face_recogniser/capture_face",
+            execute_callback=self._execute_capture_face,
+            goal_callback=self._capture_goal_callback,
+            cancel_callback=self._capture_cancel_callback,
+            callback_group=self._enrolment_callback_group,
+        )
+
+        self.commit_enrolment_service = self.create_service(
+            CommitFaceEnrollment,
+            "/face_recogniser/commit_enrolment",
+            self._commit_enrolment_callback,
+            callback_group=self._enrolment_callback_group,
+        )
+
+        self.discard_enrolment_service = self.create_service(
+            Trigger,
+            "/face_recogniser/discard_enrolment",
+            self._discard_enrolment_callback,
+            callback_group=self._enrolment_callback_group,
+        )
+
         # ------------------------------------------------------------
         # Runtime state
         # ------------------------------------------------------------
@@ -282,6 +358,9 @@ class FaceRecogniserNode(Node):
         self._image_lock = threading.Lock()
         self.latest_image_data = None
         self.latest_image_stamp = None
+
+        self._tracks_lock = threading.Lock()
+        self.latest_tracked_faces = []
 
         self.track_states: Dict[
             int,
@@ -314,6 +393,12 @@ class FaceRecogniserNode(Node):
             f"margin={self.recognition_margin:.2f}, "
             f"top_matches={self.top_matches}, "
             f"confirmations={self.confirmation_count}"
+        )
+
+        self.get_logger().info(
+            "Face enrolment ready: "
+            "/face_recogniser/capture_face + "
+            "/face_recogniser/commit_enrolment"
         )
 
     # ------------------------------------------------------------
@@ -359,6 +444,31 @@ class FaceRecogniserNode(Node):
             if not person_dir.is_dir():
                 continue
 
+            # Hidden directories are internal working areas, notably the
+            # transactional .enrolment staging directory.
+            if person_dir.name.startswith("."):
+                continue
+
+            metadata_file = person_dir / "metadata.json"
+            metadata = {
+                "schema_version": 1,
+                "name": person_dir.name,
+                "relationship": "",
+                "preferred_address": person_dir.name,
+            }
+
+            if metadata_file.exists():
+                try:
+                    loaded_metadata = json.loads(
+                        metadata_file.read_text(encoding="utf-8")
+                    )
+                    if isinstance(loaded_metadata, dict):
+                        metadata.update(loaded_metadata)
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"Could not load {metadata_file}: {exc}"
+                    )
+
             embeddings = []
 
             for filename in sorted(
@@ -400,6 +510,10 @@ class FaceRecogniserNode(Node):
                 database[
                     person_dir.name
                 ] = embeddings
+
+                self.face_database_metadata[
+                    person_dir.name
+                ] = metadata
 
                 self.get_logger().info(
                     f"Loaded {len(embeddings)} "
@@ -816,21 +930,22 @@ class FaceRecogniserNode(Node):
 
         self.recognition_attempts += 1
 
-        face = self.detect_face_in_crop(
-            face_crop
-        )
-
-        if face is None:
-            return (
-                "",
-                0.0,
-                False,
+        with self._model_lock:
+            face = self.detect_face_in_crop(
+                face_crop
             )
 
-        embedding = self.create_embedding(
-            face_crop,
-            face,
-        )
+            if face is None:
+                return (
+                    "",
+                    0.0,
+                    False,
+                )
+
+            embedding = self.create_embedding(
+                face_crop,
+                face,
+            )
 
         if embedding is None:
             return (
@@ -926,6 +1041,11 @@ class FaceRecogniserNode(Node):
     ):
 
         self.track_messages_received += 1
+
+        with self._tracks_lock:
+            self.latest_tracked_faces = list(
+                msg.faces
+            )
 
         output = RecognisedFaceArray()
         output.header = msg.header
@@ -1105,19 +1225,495 @@ class FaceRecogniserNode(Node):
         )
 
 
+    # ------------------------------------------------------------
+    # Face enrolment
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _normalise_identity(identity: str) -> str:
+        """Return a safe, human-readable identity directory name."""
+
+        cleaned = re.sub(
+            r"[^A-Za-z0-9 _'-]",
+            "",
+            identity.strip(),
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _staging_dir(self, identity: str) -> Path:
+        safe_identity = self._normalise_identity(identity)
+        return self.enrolment_staging_root / safe_identity
+
+    def _capture_goal_callback(self, goal_request):
+        identity = self._normalise_identity(goal_request.identity)
+        pose = goal_request.pose.strip().lower()
+
+        if not identity:
+            self.get_logger().warning(
+                "Rejecting face enrolment goal with empty/invalid identity"
+            )
+            return GoalResponse.REJECT
+
+        if pose not in {"front", "left", "right"}:
+            self.get_logger().warning(
+                f"Rejecting face enrolment goal with invalid pose: {pose!r}"
+            )
+            return GoalResponse.REJECT
+
+        if int(goal_request.samples_required) <= 0:
+            self.get_logger().warning(
+                "Rejecting face enrolment goal with non-positive sample count"
+            )
+            return GoalResponse.REJECT
+
+        with self._enrolment_goal_lock:
+            if self._enrolment_goal_active:
+                self.get_logger().warning(
+                    "Rejecting face enrolment goal: another capture is active"
+                )
+                return GoalResponse.REJECT
+
+            self._enrolment_goal_active = True
+
+        return GoalResponse.ACCEPT
+
+    @staticmethod
+    def _capture_cancel_callback(_goal_handle):
+        return CancelResponse.ACCEPT
+
+    def _set_capture_result(
+        self,
+        result,
+        *,
+        success: bool,
+        message: str,
+        samples_saved: int,
+    ):
+        result.success = bool(success)
+        result.message = message
+        result.samples_saved = int(samples_saved)
+        return result
+
+    def _publish_capture_feedback(
+        self,
+        goal_handle,
+        state: str,
+        samples_collected: int,
+        samples_required: int,
+    ) -> None:
+        feedback = CaptureFace.Feedback()
+        feedback.state = state
+        feedback.samples_collected = int(samples_collected)
+        feedback.samples_required = int(samples_required)
+        goal_handle.publish_feedback(feedback)
+
+    def _current_enrolment_face(self):
+        """Return exactly one current tracked face, otherwise a status string."""
+
+        with self._tracks_lock:
+            faces = list(self.latest_tracked_faces)
+
+        if not faces:
+            return None, "WAITING_FOR_FACE"
+
+        if len(faces) > 1:
+            return None, "MULTIPLE_FACES"
+
+        tracked_face = faces[0]
+
+        if not self.face_is_large_enough(tracked_face.bbox):
+            return None, "FACE_TOO_SMALL"
+
+        return tracked_face, "FACE_READY"
+
+    def _capture_embedding_from_track(self, tracked_face):
+        frame = self.get_latest_frame()
+        if frame is None:
+            return None, "WAITING_FOR_IMAGE"
+
+        crop = self.crop_face(
+            frame,
+            tracked_face.bbox,
+        )
+        if crop is None:
+            return None, "INVALID_CROP"
+
+        with self._model_lock:
+            face = self.detect_face_in_crop(crop)
+            if face is None:
+                return None, "NO_LANDMARKS"
+
+            embedding = self.create_embedding(
+                crop,
+                face,
+            )
+
+        if embedding is None:
+            return None, "EMBEDDING_FAILED"
+
+        return embedding, "CAPTURED"
+
+    def _execute_capture_face(self, goal_handle):
+        request = goal_handle.request
+        identity = self._normalise_identity(request.identity)
+        pose = request.pose.strip().lower()
+        samples_required = int(request.samples_required)
+
+        result = CaptureFace.Result()
+        samples_collected = 0
+        last_saved_time = 0.0
+        last_state = "WAITING_FOR_FACE"
+        started = time.monotonic()
+
+        try:
+            staging_dir = self._staging_dir(identity)
+
+            # A new FRONT capture is the start of a new enrolment transaction.
+            # Remove any abandoned samples from an earlier attempt.
+            if pose == "front":
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir)
+
+            staging_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            # Re-running one pose replaces only that pose's staged samples.
+            for existing in staging_dir.glob(f"{pose}_*.npy"):
+                existing.unlink()
+
+            self.get_logger().info(
+                f"Enrolling '{identity}' pose={pose}: "
+                f"{samples_required} samples required"
+            )
+
+            while samples_collected < samples_required:
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    return self._set_capture_result(
+                        result,
+                        success=False,
+                        message="Face capture cancelled.",
+                        samples_saved=samples_collected,
+                    )
+
+                elapsed = time.monotonic() - started
+                if elapsed >= self.enrolment_capture_timeout:
+                    goal_handle.abort()
+
+                    messages = {
+                        "WAITING_FOR_FACE": (
+                            "I cannot see your face clearly."
+                        ),
+                        "MULTIPLE_FACES": (
+                            "I can see several people. I require only one "
+                            "person for enrolment."
+                        ),
+                        "FACE_TOO_SMALL": (
+                            "Your face is too far away. Please move a little "
+                            "closer."
+                        ),
+                        "WAITING_FOR_IMAGE": (
+                            "I am not receiving a camera image."
+                        ),
+                        "NO_LANDMARKS": (
+                            "I cannot obtain a clear view of your face."
+                        ),
+                    }
+
+                    message = messages.get(
+                        last_state,
+                        "I could not obtain enough suitable face samples.",
+                    )
+
+                    return self._set_capture_result(
+                        result,
+                        success=False,
+                        message=message,
+                        samples_saved=samples_collected,
+                    )
+
+                now = time.monotonic()
+                if (
+                    now - last_saved_time
+                    < self.enrolment_sample_interval
+                ):
+                    time.sleep(0.05)
+                    continue
+
+                tracked_face, state = self._current_enrolment_face()
+                last_state = state
+
+                if tracked_face is None:
+                    self._publish_capture_feedback(
+                        goal_handle,
+                        state,
+                        samples_collected,
+                        samples_required,
+                    )
+                    time.sleep(0.10)
+                    continue
+
+                embedding, state = self._capture_embedding_from_track(
+                    tracked_face
+                )
+                last_state = state
+
+                if embedding is None:
+                    self._publish_capture_feedback(
+                        goal_handle,
+                        state,
+                        samples_collected,
+                        samples_required,
+                    )
+                    time.sleep(0.10)
+                    continue
+
+                samples_collected += 1
+                last_saved_time = now
+
+                filename = (
+                    staging_dir
+                    / f"{pose}_{samples_collected:03d}.npy"
+                )
+
+                np.save(
+                    filename,
+                    embedding,
+                )
+
+                state = f"CAPTURING_{pose.upper()}"
+                last_state = state
+                self._publish_capture_feedback(
+                    goal_handle,
+                    state,
+                    samples_collected,
+                    samples_required,
+                )
+
+                self.get_logger().info(
+                    f"Enrolment '{identity}' {pose}: "
+                    f"{samples_collected}/{samples_required}"
+                )
+
+            goal_handle.succeed()
+            return self._set_capture_result(
+                result,
+                success=True,
+                message=(
+                    f"Captured {samples_collected} {pose} samples for "
+                    f"{identity}."
+                ),
+                samples_saved=samples_collected,
+            )
+
+        except Exception as exc:
+            self.get_logger().error(
+                f"Face enrolment capture failed: {exc}"
+            )
+            goal_handle.abort()
+            return self._set_capture_result(
+                result,
+                success=False,
+                message=f"Face capture failed: {exc}",
+                samples_saved=samples_collected,
+            )
+
+        finally:
+            with self._enrolment_goal_lock:
+                self._enrolment_goal_active = False
+
+    def _commit_enrolment_callback(self, request, response):
+        identity = self._normalise_identity(request.identity)
+        relationship = request.relationship.strip().lower()
+        preferred_address = request.preferred_address.strip()
+
+        if not identity:
+            response.success = False
+            response.message = "Identity name is empty or invalid."
+            return response
+
+        if relationship not in {"family", "friend"}:
+            response.success = False
+            response.message = "Relationship must be family or friend."
+            return response
+
+        if not preferred_address:
+            preferred_address = identity
+
+        with self._enrolment_goal_lock:
+            capture_active = self._enrolment_goal_active
+
+        if capture_active:
+            response.success = False
+            response.message = "Face capture is still in progress."
+            return response
+
+        staging_dir = self._staging_dir(identity)
+        final_dir = self.face_database / identity
+
+        if not staging_dir.exists():
+            response.success = False
+            response.message = "No staged face samples were found."
+            return response
+
+        staged_files = sorted(staging_dir.glob("*.npy"))
+        if not staged_files:
+            response.success = False
+            response.message = "No staged face embeddings were found."
+            return response
+
+        missing_poses = [
+            pose
+            for pose in ("front", "left", "right")
+            if not list(staging_dir.glob(f"{pose}_*.npy"))
+        ]
+
+        if missing_poses:
+            response.success = False
+            response.message = (
+                "Enrolment is incomplete; missing "
+                + ", ".join(missing_poses)
+                + " samples."
+            )
+            return response
+
+        metadata = {
+            "schema_version": 1,
+            "name": identity,
+            "relationship": relationship,
+            "preferred_address": preferred_address,
+        }
+
+        identity_existed = final_dir.exists()
+
+        try:
+            self.face_database.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            if identity_existed:
+                # Preserve embeddings created by the original command-line
+                # enroller, but replace any same-named pose samples from an
+                # earlier conversational enrolment.
+                final_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                for staged_file in staged_files:
+                    destination = final_dir / staged_file.name
+                    if destination.exists():
+                        destination.unlink()
+                    shutil.move(
+                        str(staged_file),
+                        str(destination),
+                    )
+
+                (final_dir / "metadata.json").write_text(
+                    json.dumps(
+                        metadata,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                shutil.rmtree(staging_dir)
+
+            else:
+                (staging_dir / "metadata.json").write_text(
+                    json.dumps(
+                        metadata,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                shutil.move(
+                    str(staging_dir),
+                    str(final_dir),
+                )
+
+            # Make the new/updated identity available immediately.
+            self.face_database_metadata = {}
+            self.face_database_embeddings = self.load_face_database()
+            self.track_states.clear()
+
+        except Exception as exc:
+            self.get_logger().error(
+                f"Could not commit enrolment for '{identity}': {exc}"
+            )
+            response.success = False
+            response.message = f"Could not save enrolment: {exc}"
+            return response
+
+        response.success = True
+        action = (
+            "updated"
+            if identity_existed
+            else "created"
+        )
+        response.message = (
+            f"Enrolment complete for {identity}; "
+            f"{action} identity with {len(staged_files)} new face samples."
+        )
+
+        self.get_logger().info(
+            f"Committed face enrolment: name='{identity}', "
+            f"relationship='{relationship}', "
+            f"preferred_address='{preferred_address}'"
+        )
+
+        return response
+
+    def _discard_enrolment_callback(self, _request, response):
+        with self._enrolment_goal_lock:
+            if self._enrolment_goal_active:
+                response.success = False
+                response.message = (
+                    "Cannot discard enrolment while capture is still active."
+                )
+                return response
+
+        try:
+            if self.enrolment_staging_root.exists():
+                shutil.rmtree(self.enrolment_staging_root)
+
+            response.success = True
+            response.message = "Staged face enrolment discarded."
+
+        except Exception as exc:
+            response.success = False
+            response.message = f"Could not discard enrolment: {exc}"
+
+        return response
+
+
 def main(args=None):
 
     rclpy.init(args=args)
 
     node = FaceRecogniserNode()
+    executor = MultiThreadedExecutor(
+        num_threads=4
+    )
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
 
     except KeyboardInterrupt:
         pass
 
     finally:
+        executor.shutdown()
         node.destroy_node()
 
         if rclpy.ok():
